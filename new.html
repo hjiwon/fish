@@ -1,0 +1,641 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Interactive Floating Drawing with Fish, Bird & Custom Material</title>
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      overflow: hidden;
+      background: #87CEEB;
+    }
+    canvas {
+      display: block;
+      cursor: crosshair;
+    }
+    /* 재질 선택 버튼 패널 */
+    #material-buttons {
+      position: fixed;
+      top: 10px;
+      left: 10px;
+      background: rgba(255, 255, 255, 0.8);
+      padding: 5px;
+      border-radius: 5px;
+      z-index: 10;
+    }
+    #material-buttons button {
+      margin: 2px;
+      padding: 5px 10px;
+      cursor: pointer;
+    }
+    #material-buttons button.active {
+      background: #333;
+      color: #fff;
+    }
+  </style>
+</head>
+<body>
+  <!-- 재질 선택 UI -->
+  <div id="material-buttons">
+    <button data-material="Wood" class="active">Wood</button>
+    <button data-material="Iron">Iron</button>
+    <button data-material="Fish Food">Fish Food</button>
+  </div>
+  <canvas id="canvas"></canvas>
+  <script>
+    const canvas = document.getElementById('canvas');
+    const ctx = canvas.getContext('2d');
+    let width = window.innerWidth;
+    let height = window.innerHeight;
+    canvas.width = width;
+    canvas.height = height;
+    
+    window.addEventListener('resize', () => {
+      width = window.innerWidth;
+      height = window.innerHeight;
+      canvas.width = width;
+      canvas.height = height;
+    });
+    
+    // 파도 관련 설정값
+    const waveConfig = {
+      waveHeight: 250,
+      amplitude1: 45,
+      frequency1: 0.01,
+      amplitude2: 10,
+      frequency2: 0.02,
+    };
+    
+    let time = 0;
+    
+    // 물체(그림)들을 저장할 배열
+    const objects = [];
+    // 현재 그리고 있는 그림의 점들
+    let currentDrawing = [];
+    let isDrawing = false;
+    
+    // 물리 설정값
+    const gravity = 0.5;
+    const drag = 0.98;
+    const waveForceFactor = 0.1;
+    
+    // 물의 밀도 기준
+    const waterDensity = 1.0;
+    
+    // 재질 목록 (버튼에서 선택)
+    const materials = [
+      { name: "Wood", density: 0.6, color: "#A0522D" },
+      { name: "Iron", density: 2.5, color: "#808080" },
+      { name: "Fish Food", density: 0.2, color: "#228B22" } // 어두운 초록색
+    ];
+    
+    // 현재 선택된 재질 (기본: Wood)
+    let nextMaterial = materials[0];
+    
+    // 재질 선택 버튼 이벤트 처리
+    document.querySelectorAll("#material-buttons button").forEach(button => {
+      button.addEventListener('click', () => {
+        document.querySelectorAll("#material-buttons button").forEach(btn => btn.classList.remove("active"));
+        button.classList.add("active");
+        const matName = button.getAttribute("data-material");
+        nextMaterial = materials.find(m => m.name === matName) || materials[0];
+      });
+    });
+    
+    // 충돌 반발 계수 (0~1)
+    const elasticity = 0.5;
+    // 무게 계산을 위한 스케일 (면적에 따른 kg 값)
+    const weightScale = 2000;
+    
+    // 마우스 좌표 추적 (물고기 인터랙션 위해)
+    const mouse = { x: -100, y: -100 };
+    canvas.addEventListener('mousemove', (e) => {
+      const rect = canvas.getBoundingClientRect();
+      mouse.x = e.clientX - rect.left;
+      mouse.y = e.clientY - rect.top;
+      if(isDrawing){
+        currentDrawing.push({
+          x: mouse.x,
+          y: mouse.y
+        });
+      }
+    });
+    
+    canvas.addEventListener('mousedown', (e) => {
+      isDrawing = true;
+      currentDrawing = [];
+      const rect = canvas.getBoundingClientRect();
+      currentDrawing.push({
+        x: e.clientX - rect.left,
+        y: e.clientY - rect.top
+      });
+    });
+    
+    canvas.addEventListener('mouseup', (e) => {
+      isDrawing = false;
+      if (currentDrawing.length < 2) return;
+      
+      let minX = currentDrawing[0].x, maxX = currentDrawing[0].x;
+      let minY = currentDrawing[0].y, maxY = currentDrawing[0].y;
+      for (let pt of currentDrawing) {
+        if (pt.x < minX) minX = pt.x;
+        if (pt.x > maxX) maxX = pt.x;
+        if (pt.y < minY) minY = pt.y;
+        if (pt.y > maxY) maxY = pt.y;
+      }
+      const centerX = (minX + maxX) / 2;
+      const centerY = (minY + maxY) / 2;
+      
+      const shape = currentDrawing.map(pt => ({
+        x: pt.x - centerX,
+        y: pt.y - centerY
+      }));
+      
+      const objWidth = maxX - minX;
+      const objHeight = maxY - minY;
+      let radius = Math.sqrt(objWidth * objWidth + objHeight * objHeight) / 2;
+      
+      const area = objWidth * objHeight;
+      const weight = Math.max(1, Math.round(area / weightScale));
+      
+      const newObj = {
+        pos: { x: centerX, y: centerY },
+        vel: { x: 0, y: 0 },
+        shape: shape,
+        weight: weight,
+        initialWeight: weight,
+        material: nextMaterial,
+        width: objWidth,
+        height: objHeight,
+        radius: radius,
+        scale: 1
+      };
+      if(newObj.material.name === "Fish Food"){
+        newObj.originalShape = shape.map(pt => ({ x: pt.x, y: pt.y }));
+      }
+      objects.push(newObj);
+      currentDrawing = [];
+    });
+    
+    // 파도 수평 힘 (경사)
+    function getWaveSlope(x, t) {
+      const { amplitude1, frequency1, amplitude2, frequency2 } = waveConfig;
+      return amplitude1 * frequency1 * Math.cos(x * frequency1 + t) +
+             amplitude2 * frequency2 * 1.5 * Math.cos(x * frequency2 + t * 1.5);
+    }
+    
+    // 파도 수면 높이
+    function getWaterLevel(x, t) {
+      const { waveHeight, amplitude1, frequency1, amplitude2, frequency2 } = waveConfig;
+      const baseY = height - waveHeight;
+      return baseY + amplitude1 * Math.sin(x * frequency1 + t) +
+                     amplitude2 * Math.sin(x * frequency2 + t * 1.5);
+    }
+    
+    function handleCollisions() {
+      for (let i = 0; i < objects.length; i++) {
+        for (let j = i + 1; j < objects.length; j++) {
+          const objA = objects[i];
+          const objB = objects[j];
+          const dx = objB.pos.x - objA.pos.x;
+          const dy = objB.pos.y - objA.pos.y;
+          const dist = Math.hypot(dx, dy);
+          const minDist = objA.radius + objB.radius;
+          if (dist < minDist && dist > 0) {
+            const overlap = minDist - dist;
+            const nx = dx / dist;
+            const ny = dy / dist;
+            const totalWeight = objA.weight + objB.weight;
+            const correctionA = (overlap * (objB.weight / totalWeight));
+            const correctionB = (overlap * (objA.weight / totalWeight));
+            objA.pos.x -= nx * correctionA;
+            objA.pos.y -= ny * correctionA;
+            objB.pos.x += nx * correctionB;
+            objB.pos.y += ny * correctionB;
+            const rvx = objB.vel.x - objA.vel.x;
+            const rvy = objB.vel.y - objA.vel.y;
+            const relVel = rvx * nx + rvy * ny;
+            if (relVel < 0) {
+              const impulse = -(1 + elasticity) * relVel / (1/objA.weight + 1/objB.weight);
+              const impulseX = impulse * nx;
+              const impulseY = impulse * ny;
+              objA.vel.x -= impulseX / objA.weight;
+              objA.vel.y -= impulseY / objA.weight;
+              objB.vel.x += impulseX / objB.weight;
+              objB.vel.y += impulseY / objB.weight;
+            }
+          }
+        }
+      }
+    }
+    
+    // 물고기 객체들 (작고, 어두운 색상)
+    const fishArray = [];
+    const numFish = 5;
+    for (let i = 0; i < numFish; i++) {
+      fishArray.push({
+        pos: {
+          x: Math.random() * width,
+          y: height - waveConfig.waveHeight - 30 - Math.random() * 50
+        },
+        vel: {
+          x: (Math.random() - 0.5) * 2,
+          y: (Math.random() - 0.5) * 1
+        },
+        size: 6 + Math.random() * 5,
+        color: `hsl(${200 + Math.random() * 20}, 50%, ${20 + Math.random() * 10}%)`,
+        biteCooldown: 0
+      });
+    }
+    
+    // 새(bird) 객체 – 자연스러운 곡선 비행 & 정확한 타겟팅
+    const bird = {
+      pos: { x: width / 2, y: 50 },
+      vx: 2,
+      vy: 0,
+      state: "flying", // flying, diving, returning
+      diveTimer: 8,   // 10초 후 다이빙
+      initialY: 50,
+      target: null,
+      angle: 0
+    };
+    function updateAndDrawBird() {
+  // --- 새의 상태 업데이트 ---
+
+
+  // --- 윈도우 경계 제한 ---
+  if (bird.pos.x < 0) { bird.pos.x = 0; bird.vx = -bird.vx }
+  if (bird.pos.x > width) { bird.pos.x = width; bird.vx = -bird.vx }
+  if (bird.pos.y < 0) { bird.pos.y = 0; bird.state = "returning"; }
+  if (bird.pos.y > height) { bird.pos.y = height; bird.state = "returning" }
+
+  if (bird.state === "flying") {
+    // 자연스러운 곡선 비행: vx는 일정, vy는 사인 함수로 약간 흔들림
+    bird.vy = Math.sin(time * 0.5) * 2;
+    bird.pos.x += bird.vx;
+    // 비행 중에는 고도가 bird.initialY를 기준으로 진동하도록
+    bird.pos.y = bird.initialY + Math.sin(time * 0.5) * 2;
+    bird.angle = Math.atan2(bird.vy, bird.vx);
+    
+    bird.diveTimer -= 0.02;
+    if (bird.diveTimer <= 0) {
+
+        bird.state = "diving";
+    }
+  } else if (bird.state === "diving") {
+    // 다이빙: 타겟으로 부드럽게 이동 (lerp)
+
+      // 가장 가까운 물고기 타겟팅 (거리 150px 이하일 때)
+      let closestFish = null;
+      let minDist = Infinity;
+      for (let fish of fishArray) {
+        let d = Math.hypot(bird.pos.x - fish.pos.x, bird.pos.y - fish.pos.y);
+        if (d < minDist) {
+          minDist = d;
+          closestFish = fish;
+        }
+      }
+      if (closestFish) {
+        // 타겟의 현재 위치를 복사해서 target으로 지정
+        bird.target = { x: closestFish.pos.x, y: closestFish.pos.y };
+      } else {
+        // 타겟 없으면 diveTimer를 재설정
+        bird.diveTimer = 8;
+      }
+
+    let lerpFactor = 0.05; // 다이빙 속도 조절
+    bird.pos.x += (bird.target.x - bird.pos.x) * lerpFactor;
+    bird.pos.y += (bird.target.y - bird.pos.y) * lerpFactor;
+    bird.angle = Math.atan2(bird.target.y - bird.pos.y, bird.target.x - bird.pos.x);
+    
+    // 만약 타겟(물고기)과의 거리가 catchDistance 이내이면 물고기 잡기
+    const catchDistance = 25;
+    if (Math.hypot(bird.pos.x - bird.target.x, bird.pos.y - bird.target.y) < catchDistance) {
+      // 실제로 잡아먹기: 가장 가까운 물고기를 제거
+      for (let i = 0; i < fishArray.length; i++) {
+        let f = fishArray[i];
+        if (Math.hypot(bird.pos.x - f.pos.x, bird.pos.y - f.pos.y) < catchDistance) {
+          fishArray.splice(i, 1);
+          break;
+        }
+      }
+      bird.state = "returning";
+    }
+  } else if (bird.state === "returning") {
+    // 복귀: 새의 y좌표가 bird.initialY에 도달하도록 부드럽게 복귀
+    const lerpFactor = 0.015;
+    bird.pos.y += (bird.initialY - bird.pos.y) * lerpFactor;
+    // x좌표는 현재 방향을 유지하거나 천천히 중앙으로 복귀하도록 조정할 수 있음
+    // 여기서는 x는 그대로 유지.
+    bird.angle = Math.atan2(bird.initialY - bird.pos.y, 0.001); // 수평 기준(0.001으로 0나누는 문제 방지)
+    // 복귀 완료 판단: y좌표 차이가 5px 미만이면
+    if (Math.abs(bird.pos.y - bird.initialY) < 5) {
+      bird.pos.y = bird.initialY;
+      bird.state = "flying";
+      bird.diveTimer = 8;
+      bird.target = null;
+    }
+  }
+  
+  
+  // --- 새 그리기 ---
+  ctx.save();
+  ctx.translate(bird.pos.x, bird.pos.y);
+  ctx.rotate(bird.angle);
+  
+  // 새의 몸통: 작고 타원 형태
+  ctx.fillStyle = "#333";
+  ctx.beginPath();
+  ctx.ellipse(0, 0, 10, 4, 0, 0, 2 * Math.PI);
+  ctx.fill();
+  
+  // 날개: V자 형태로, 좌우 대칭
+  ctx.beginPath();
+  ctx.moveTo(-5, 0);
+  ctx.lineTo(-15, -10);
+  ctx.lineTo(-10, 0);
+  ctx.lineTo(-15, 10);
+  ctx.closePath();
+  ctx.fill();
+  
+  ctx.restore();
+}
+
+    // 전역 변수로 알(egg)들을 저장할 배열을 추가함
+const eggs = [];
+
+// 기존 물고기 업데이트 함수에서, 물고기가 음식을 먹을 때 foodEaten 카운트를 추가함
+function updateAndDrawFish() {
+  for (let fish of fishArray) {
+    fish.biteCooldown = Math.max(0, fish.biteCooldown - 0.03);
+    // foodEaten 초기화 (없으면 0으로)
+    if (typeof fish.foodEaten === "undefined") fish.foodEaten = 0;
+    let dx = fish.pos.x - bird.pos.x;
+    let dy = fish.pos.y - bird.pos.y;
+    let dist = Math.hypot(dx, dy);
+
+    if (bird.state === "diving" && dist < 80) { 
+      let escapeSpeed = 0.05;
+      fish.vel.x += (dx / dist) * escapeSpeed / 2;
+      fish.vel.y += (dy / dist) * escapeSpeed / 2;
+      fish.pos.x += fish.vel.x;
+      fish.pos.y += fish.vel.y;
+    }
+    let mouseDx = fish.pos.x - mouse.x;
+  let mouseDy = fish.pos.y - mouse.y;
+  let mouseDist = Math.hypot(mouseDx, mouseDy);
+
+  if (mouseDist < 100) {  // 100px 이내면 도망
+    let mouseEscapeSpeed = 2 + (100 - mouseDist) * 0.05;  // 가까울수록 빠르게 반응
+    fish.vel.x += (mouseDx / mouseDist) * mouseEscapeSpeed;
+    fish.vel.y += (mouseDy / mouseDist) * mouseEscapeSpeed;
+  }
+    
+    
+    let target = null;
+    let minDist = Infinity;
+    for (let obj of objects) {
+      if (obj.material.name === "Fish Food") {
+        const dx = obj.pos.x - fish.pos.x;
+        const dy = obj.pos.y - fish.pos.y;
+        const d = Math.hypot(dx, dy);
+        if (d < minDist) {
+          minDist = d;
+          target = obj;
+        }
+      }
+    }
+    if (target && fish.biteCooldown <= 0) {
+      const angle = Math.atan2(target.pos.y - fish.pos.y, target.pos.x - fish.pos.x);
+      fish.vel.x += Math.cos(angle) * 0.2;
+      fish.vel.y += Math.sin(angle) * 0.2;
+      if (minDist < 30 && fish.biteCooldown <= 0) {
+        // 물고기가 한 입 먹었음
+        target.weight = Math.max(0, target.weight - 0.1);
+        if (target.material.name === "Fish Food") {
+          target.scale = target.weight / target.initialWeight;
+          target.radius = (Math.sqrt(target.width * target.width + target.height * target.height) / 2) * target.scale;
+        }
+        fish.biteCooldown = 2 + Math.random(); // 2~3초 대기
+        // 음식 한 입 먹었을 때, foodEaten 카운트 증가
+        fish.foodEaten += 1;
+        // 만약 음식 10회 먹었으면 알 생성
+        if (fish.foodEaten >= 3) {
+          fish.foodEaten = 0; // 카운트 초기화
+          eggs.push({
+            pos: { x: fish.pos.x, y: fish.pos.y },
+            vy: 0,
+            hatchTimer: 10  // 10초 후 부화
+          });
+        }
+        if (target.weight <= 0) {
+          const index = objects.indexOf(target);
+          if (index > -1) {
+            objects.splice(index, 1);
+          }
+        }
+      }
+    } 
+
+    fish.vel.x += (Math.random() - 0.5) * 0.2;
+    fish.vel.y += (Math.random() - 0.5) * 0.2;
+  
+    const speed = Math.hypot(fish.vel.x, fish.vel.y);
+    const minSpeed = 1;  // 최소 속도 설정
+    const maxSpeed = 3;    // 최대 속도 유지
+
+    // 속도를 maxSpeed 이하로 제한
+    if (speed > maxSpeed) {
+      fish.vel.x = (fish.vel.x / speed) * maxSpeed;
+      fish.vel.y = (fish.vel.y / speed) * maxSpeed;
+    }
+
+    // 속도를 minSpeed 이상으로 유지
+    if (speed < minSpeed) {
+      fish.vel.x = (fish.vel.x / speed) * minSpeed;
+      fish.vel.y = (fish.vel.y / speed) * minSpeed;
+    } else {
+      // 점진적으로 속도 감소 (마찰 효과)
+      fish.vel.x *= 0.99;
+      fish.vel.y *= 0.99;
+    }
+
+    fish.pos.x += fish.vel.x;
+    fish.pos.y += fish.vel.y;
+    if (fish.pos.x < 0) fish.pos.x = width;  
+    if (fish.pos.x > width) fish.pos.x = 0;  
+
+    const waterLevel = getWaterLevel(fish.pos.x, time);
+    if (fish.pos.y < waterLevel - 10) {
+      fish.vel.y += 0.15;
+    } else if (fish.pos.y > waterLevel + 2) {
+      fish.vel.y -= 0.02;
+    } else {
+      fish.vel.y += 0.15
+    }
+    ctx.save();
+    ctx.translate(fish.pos.x, fish.pos.y);
+    const angle = Math.atan2(fish.vel.y, fish.vel.x);
+    ctx.rotate(angle);
+    ctx.fillStyle = fish.color;
+    ctx.beginPath();
+    ctx.ellipse(0, 0, fish.size, fish.size * 0.5, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.beginPath();
+    ctx.moveTo(-fish.size, 0);
+    ctx.lineTo(-fish.size - 5, -3);
+    ctx.lineTo(-fish.size - 5, 3);
+    ctx.closePath();
+    ctx.fill();
+    ctx.restore();
+  }
+  
+  // --- 알(egg) 업데이트 및 그리기 ---
+  for (let i = eggs.length - 1; i >= 0; i--) {
+    let egg = eggs[i];
+    // 알은 중력의 영향을 받아 바닥으로 떨어짐
+    if (egg.pos.y < height - 20) {  // 바닥 20px 위까지 떨어짐
+      egg.vy += gravity * 0.1;  // 약한 중력 적용
+      egg.pos.y += egg.vy;
+      if (egg.pos.y > height - 20) egg.pos.y = height - 20;
+    } else {
+      // 바닥에 닿으면 hatchTimer 감소
+      egg.hatchTimer -= 0.02;
+      if (egg.hatchTimer <= 0) {
+        // 알이 부화하면 새로운 물고기를 생성
+        fishArray.push({
+          pos: { x: egg.pos.x, y: egg.pos.y },
+          vel: { x: (Math.random() - 0.5) * 2, y: (Math.random() - 0.5) * 1 },
+          size: 6 + Math.random() * 5,
+          color: `hsl(${200 + Math.random() * 20}, 50%, ${20 + Math.random() * 10}%)`,
+          biteCooldown: 0,
+          foodEaten: 0
+        });
+        eggs.splice(i, 1); // 알 제거
+      }
+    }
+    
+    // 알 그리기 (작은 타원 형태)
+    ctx.save();
+    ctx.translate(egg.pos.x, egg.pos.y);
+    ctx.fillStyle = "#FFC107"; // 알 색깔 (황금빛)
+    ctx.beginPath();
+    ctx.ellipse(0, 0, 5, 7, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+  }
+}
+
+    
+    function animate() {
+      ctx.clearRect(0, 0, width, height);
+      // 파도(바다 수면) 그리기
+      ctx.beginPath();
+      const baseY = height - waveConfig.waveHeight;
+      ctx.moveTo(0, height);
+      for (let x = 0; x <= width; x++) {
+        const y = baseY + waveConfig.amplitude1 * Math.sin(x * waveConfig.frequency1 + time) +
+                        waveConfig.amplitude2 * Math.sin(x * waveConfig.frequency2 + time * 1.5);
+        ctx.lineTo(x, y);
+      }
+      ctx.lineTo(width, height);
+      ctx.closePath();
+      ctx.fillStyle = '#fff';
+      ctx.fill();
+      
+      // 물체(그림) 물리 업데이트
+      for (let obj of objects) {
+        const waterLevel = getWaterLevel(obj.pos.x, time);
+        const waveSlope = getWaveSlope(obj.pos.x, time);
+        obj.vel.y += gravity;
+        const buoyancy = (waterDensity - obj.material.density) * 0.8;
+        if (obj.pos.y >= waterLevel) {
+          obj.vel.y -= buoyancy;
+          obj.vel.x += waveSlope * waveForceFactor;
+          obj.vel.x *= drag;
+          obj.vel.y *= drag;
+          const diff = obj.pos.y - waterLevel;
+          if(diff > 0) {
+            obj.pos.y -= diff * 0.05;
+          }
+        }
+        obj.pos.x += obj.vel.x;
+        obj.pos.y += obj.vel.y;
+        if(obj.material.name === "Fish Food" && obj.originalShape){
+          obj.scale = obj.weight / obj.initialWeight;
+          obj.radius = (Math.sqrt(obj.width * obj.width + obj.height * obj.height) / 2) * obj.scale;
+        }
+      }
+      
+      // 화면 밖으로 나간 음식(Fish Food) 제거 (여유 100px)
+      for (let i = objects.length - 1; i >= 0; i--) {
+        let obj = objects[i];
+        if(obj.material.name === "Fish Food") {
+          if(obj.pos.x < -100 || obj.pos.x > width + 100 || obj.pos.y < -100 || obj.pos.y > height + 100) {
+            objects.splice(i, 1);
+          }
+        }
+      }
+      
+      if (objects.length > 1) {
+        handleCollisions();
+      }
+      
+      // 물체(그림) 그리기
+      for (let obj of objects) {
+        ctx.save();
+        ctx.translate(obj.pos.x, obj.pos.y);
+        ctx.beginPath();
+        if(obj.material.name === "Fish Food" && obj.originalShape){
+          const scaledShape = obj.originalShape.map(pt => ({
+            x: pt.x * obj.scale,
+            y: pt.y * obj.scale
+          }));
+          ctx.moveTo(scaledShape[0].x, scaledShape[0].y);
+          for (let i = 1; i < scaledShape.length; i++) {
+            ctx.lineTo(scaledShape[i].x, scaledShape[i].y);
+          }
+        } else {
+          ctx.moveTo(obj.shape[0].x, obj.shape[0].y);
+          for (let i = 1; i < obj.shape.length; i++) {
+            ctx.lineTo(obj.shape[i].x, obj.shape[i].y);
+          }
+        }
+        ctx.closePath();
+        ctx.strokeStyle = obj.material.color;
+        ctx.lineWidth = 2;
+        ctx.stroke();
+        ctx.restore();
+        
+        ctx.font = '16px sans-serif';
+        ctx.fillStyle = '#000';
+        const text = `${obj.weight.toFixed(1)} kg / ${obj.material.name}`;
+        const textWidth = ctx.measureText(text).width;
+        ctx.fillText(text, obj.pos.x - textWidth / 2, obj.pos.y + obj.height/2 + 20);
+      }
+      
+      // 현재 그리고 있는 그림 그리기
+      if (isDrawing && currentDrawing.length > 1) {
+        ctx.beginPath();
+        ctx.moveTo(currentDrawing[0].x, currentDrawing[0].y);
+        for (let i = 1; i < currentDrawing.length; i++) {
+          ctx.lineTo(currentDrawing[i].x, currentDrawing[i].y);
+        }
+        ctx.strokeStyle = '#333';
+        ctx.lineWidth = 2;
+        ctx.stroke();
+      }
+      
+      updateAndDrawFish();
+      updateAndDrawBird();
+      
+      time += 0.02;
+      requestAnimationFrame(animate);
+    }
+    
+    animate();
+  </script>
+</body>
+</html>
